@@ -1,116 +1,171 @@
 import os
+import re
 import time
 import json
+import threading
 import requests
 from datetime import datetime, date
 from dotenv import load_dotenv
+from web3 import Web3
 
-OPINION_URL = "https://openapi.opinion.trade/openapi/trade/user/{wallet}"
-
-# ====== Bạn chỉnh 2 dòng này nếu muốn ======
-POLL_SECONDS = 5              # quét ví mỗi N giây (bạn muốn 5 thì đổi thành 5)
-HEARTBEAT_PRINT_SECONDS = 3600  # 1 tiếng in 1 lần
-# ===========================================
-
+# ============================================================
+# CONFIG
+# ============================================================
+OPINION_TRADE_URL = "https://openapi.opinion.trade/openapi/trade/user/{wallet}"
+POLL_SECONDS = 5
+HEARTBEAT_SECONDS = 3600
 DAILY_FILE = "daily_summary.json"
+STATE_FILE = "state.json"
+
+# Opinion Safe Proxy Factory contract
+SAFE_PROXY_FACTORY = "0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2"
+
+# Telegram API base
+TG_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
-def send_telegram(token: str, chat_id: str, text: str) -> None:
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+# ============================================================
+# FIND SMART WALLET (scrape BscScan, không cần API key)
+# ============================================================
+
+def find_smart_wallet(eoa_address: str) -> str | None:
+    """
+    Scrape BscScan để tìm smart wallet của EOA.
+    Tìm transaction tới Safe Proxy Factory, đọc địa chỉ contract được tạo.
+    """
+    eoa = eoa_address.lower()
+    factory_lower = SAFE_PROXY_FACTORY.lower()
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+    }
+
     try:
-        resp = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=30)
-        if resp.status_code != 200:
-            print("❌ Telegram API error:", resp.status_code, resp.text)
+        # Lấy danh sách tx của EOA từ BscScan
+        url = f"https://bscscan.com/txs?a={eoa}&f=2"
+        print(f"  Đang lấy danh sách tx: {url}")
+        resp = requests.get(url, headers=headers, timeout=30)
+        html = resp.text
+
+        # Tìm tất cả tx hash trong trang
+        tx_hashes = re.findall(r'href="/tx/(0x[a-fA-F0-9]{64})"', html)
+        print(f"  Tìm thấy {len(tx_hashes)} tx trong trang")
+
+        for tx_hash in tx_hashes:
+            tx_url = f"https://bscscan.com/tx/{tx_hash}"
+            print(f"  Kiểm tra tx: {tx_hash[:20]}...")
+            tx_resp = requests.get(tx_url, headers=headers, timeout=30)
+            tx_html = tx_resp.text
+
+            if factory_lower in tx_html.lower():
+                print(f"  ✅ Tìm thấy tx tới factory!")
+                # Tìm địa chỉ contract được tạo (Created)
+                created = re.findall(
+                    r'Created\s*\]\s*<[^>]*>\s*<[^>]*href="/address/(0x[a-fA-F0-9]{40})"',
+                    tx_html, re.DOTALL
+                )
+                if not created:
+                    # Thử pattern khác
+                    created = re.findall(
+                        r'\[.*?Created.*?\].*?/address/(0x[a-fA-F0-9]{40})',
+                        tx_html, re.DOTALL
+                    )
+                if created:
+                    return Web3.to_checksum_address(created[0])
+
+            time.sleep(0.5)  # tránh bị block
+
     except Exception as e:
-        print("❌ Telegram send error:", repr(e))
+        print("❌ find_smart_wallet error:", repr(e))
+
+    return None
 
 
-def fetch_trades(api_key: str, wallet: str):
-    """
-    Gọi endpoint lịch sử trade của user (wallet).
-    GET https://openapi.opinion.trade/openapi/trade/user/{walletAddress}
-    """
-    url = OPINION_URL.format(wallet=wallet)
-    headers = {"apikey": api_key}
+# ============================================================
+# TELEGRAM HELPERS
+# ============================================================
 
-    # Retry để đỡ lag mạng / server chậm
-    last_err = None
-    for _ in range(3):
-        try:
-            resp = requests.get(url, headers=headers, timeout=45)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, dict) and "data" in data:
-                return data["data"]
-            return data
-        except Exception as e:
-            last_err = e
-            time.sleep(2)
-
-    raise last_err
+def tg(token, method, **kwargs):
+    url = TG_BASE.format(token=token, method=method)
+    try:
+        resp = requests.post(url, json=kwargs, timeout=30)
+        return resp.json()
+    except Exception as e:
+        print("❌ Telegram error:", repr(e))
+        return {}
 
 
-def pick_id(trade: dict) -> str:
-    """
-    Dùng để chống trùng: ưu tiên txHash, fallback tradeNo, fallback createdAt.
-    """
-    for k in ["txHash", "tradeNo", "createdAt", "id"]:
-        v = trade.get(k)
-        if v:
-            return str(v)
-    return str(trade)
+def send_message(token, chat_id, text, reply_markup=None, parse_mode=None):
+    kwargs = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        kwargs["reply_markup"] = reply_markup
+    if parse_mode:
+        kwargs["parse_mode"] = parse_mode
+    return tg(token, "sendMessage", **kwargs)
 
 
-def fmt_outcome(outcome_side) -> str:
-    # 1 = YES, 2 = NO
-    if str(outcome_side) == "1":
-        return "YES"
-    if str(outcome_side) == "2":
-        return "NO"
-    return str(outcome_side)
+def answer_callback(token, callback_query_id, text=None):
+    kwargs = {"callback_query_id": callback_query_id}
+    if text:
+        kwargs["text"] = text
+    tg(token, "answerCallbackQuery", **kwargs)
 
 
-def format_trade_message(wallet: str, t: dict) -> str:
-    side = t.get("side", "")
-    outcome = fmt_outcome(t.get("outcomeSide"))
-    price = t.get("price")
-    amount = t.get("amount")
-    usd_amount = t.get("usdAmount")
-    shares = t.get("shares")
-    fee = t.get("fee")
-    tx = t.get("txHash", "")
-    created = t.get("createdAt", "")
+def edit_message(token, chat_id, message_id, text, reply_markup=None):
+    kwargs = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup:
+        kwargs["reply_markup"] = reply_markup
+    tg(token, "editMessageText", **kwargs)
 
-    lines = [
-        "✅ EXECUTED (Opinion)",
-        f"Wallet: {wallet}",
-        f"Side: {side} | Outcome: {outcome}",
-        f"Price: {price}",
-        f"Amount: {amount} | USD: {usd_amount}",
-        f"Shares: {shares}",
-        f"Fee: {fee}",
+
+# ============================================================
+# MAIN MENU
+# ============================================================
+
+MAIN_MENU_MARKUP = {
+    "inline_keyboard": [
+        [{"text": "🔍 Find Smart Wallet", "callback_data": "find_wallet"}],
+        [{"text": "👁 Monitor Wallet",    "callback_data": "monitor_wallet"}],
+        [{"text": "🤖 Copy Trade",        "callback_data": "copy_trade"}],
     ]
-    if tx:
-        lines.append(f"Tx: {tx}")
-    if created:
-        lines.append(f"Time: {created}")
-
-    return "\n".join(lines)
+}
 
 
-# ---------------- Daily summary storage ----------------
+def send_main_menu(token, chat_id):
+    send_message(
+        token, chat_id,
+        "👋 Chào mừng! Chọn tính năng bạn muốn dùng:",
+        reply_markup=MAIN_MENU_MARKUP
+    )
+
+
+# ============================================================
+# STATE MANAGEMENT
+# ============================================================
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ============================================================
+# DAILY SUMMARY
+# ============================================================
 
 def load_daily():
     today_str = str(date.today())
-    if not os.path.exists(DAILY_FILE):
-        return {"date": today_str, "total": 0, "markets": []}
     try:
         with open(DAILY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if data.get("date") != today_str:
-            # sang ngày mới thì reset
-            return {"date": today_str, "total": 0, "markets": []}
-        if "total" not in data or "markets" not in data:
             return {"date": today_str, "total": 0, "markets": []}
         return data
     except Exception:
@@ -122,133 +177,421 @@ def save_daily(daily):
         json.dump(daily, f, ensure_ascii=False, indent=2)
 
 
-def extract_market_name(t: dict) -> str:
-    """
-    Mình không chắc API trả field nào, nên mình thử vài key phổ biến.
-    Nếu không có thì fallback 'unknown'.
-    """
-    for k in ["marketName", "marketTitle", "title", "question"]:
-        v = t.get(k)
-        if v:
-            return str(v)
-
-    # Nếu không có tên, ít nhất lấy marketId/rootMarketId
-    market_id = t.get("marketId")
-    root_market_id = t.get("rootMarketId")
-
-    if market_id:
-        return f"marketId:{market_id}"
-    if root_market_id:
-        return f"rootMarketId:{root_market_id}"
-
-    return "unknown"
-
-
-def add_trade_to_daily(daily, trade: dict):
+def add_trade_to_daily(daily, trade):
     today_str = str(date.today())
     if daily.get("date") != today_str:
         daily = {"date": today_str, "total": 0, "markets": []}
-
     daily["total"] = int(daily.get("total", 0)) + 1
-
-    m = extract_market_name(trade)
-    if m not in daily["markets"]:
-        daily["markets"].append(m)
-
+    market = extract_market_name(trade)
+    if market not in daily["markets"]:
+        daily["markets"].append(market)
     save_daily(daily)
     return daily
 
 
-def build_daily_summary(wallet: str, daily) -> str:
+def extract_market_name(t):
+    for k in ["marketName", "marketTitle", "title", "question"]:
+        v = t.get(k)
+        if v:
+            return str(v)
+    if t.get("marketId"):
+        return f"marketId:{t['marketId']}"
+    if t.get("rootMarketId"):
+        return f"rootMarketId:{t['rootMarketId']}"
+    return "unknown"
+
+
+def build_daily_summary(wallet, daily):
     d = daily.get("date", str(date.today()))
     total = daily.get("total", 0)
     markets = daily.get("markets", [])
-
     lines = [
         f"📊 Daily Summary ({d})",
         f"Wallet: {wallet}",
         f"Total executed trades: {total}",
         "Markets traded today:",
     ]
-
-    if not markets:
-        lines.append("- (none)")
-    else:
-        for m in markets:
-            lines.append(f"- {m}")
-
+    for m in (markets or ["(none)"]):
+        lines.append(f"- {m}")
     return "\n".join(lines)
 
 
-# ---------------- Main loop ----------------
+# ============================================================
+# TRADE POLLING
+# ============================================================
+
+def pick_id(trade):
+    for k in ["txHash", "tradeNo", "createdAt", "id"]:
+        v = trade.get(k)
+        if v:
+            return str(v)
+    return str(trade)
+
+
+def fmt_outcome(side):
+    return "YES" if str(side) == "1" else "NO" if str(side) == "2" else str(side)
+
+
+def format_trade_message(wallet, t):
+    lines = [
+        "✅ TRADE EXECUTED (Opinion)",
+        f"Wallet: `{wallet}`",
+        f"Side: {t.get('side', '')} | Outcome: {fmt_outcome(t.get('outcomeSide'))}",
+        f"Price: {t.get('price')}",
+        f"Amount: {t.get('amount')} | USD: {t.get('usdAmount')}",
+        f"Shares: {t.get('shares')}",
+        f"Fee: {t.get('fee')}",
+    ]
+    if t.get("txHash"):
+        lines.append(f"Tx: `{t['txHash']}`")
+    if t.get("createdAt"):
+        lines.append(f"Time: {t['createdAt']}")
+    return "\n".join(lines)
+
+
+def fetch_trades(api_key, wallet):
+    url = OPINION_TRADE_URL.format(wallet=wallet)
+    headers = {"apikey": api_key}
+    last_err = None
+    for _ in range(3):
+        try:
+            resp = requests.get(url, headers=headers, timeout=45)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["data"] if isinstance(data, dict) and "data" in data else data
+        except Exception as e:
+            last_err = e
+            time.sleep(2)
+    raise last_err
+
+
+# ============================================================
+# MONITOR THREAD
+# ============================================================
+
+class MonitorThread(threading.Thread):
+    def __init__(self, token, chat_id, api_key, wallet):
+        super().__init__(daemon=True)
+        self.token = token
+        self.chat_id = chat_id
+        self.api_key = api_key
+        self.wallet = wallet
+        self.stop_event = threading.Event()
+
+        state = load_state()
+        self.last_seen_id = state.get("last_seen_id")
+        self.daily = load_daily()
+        self.last_heartbeat = 0
+        self.last_summary_date = None
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        print(f"🚀 Monitor started: {self.wallet}")
+        send_message(
+            self.token, self.chat_id,
+            f"👁 Bắt đầu monitor ví:\n`{self.wallet}`",
+            parse_mode="Markdown"
+        )
+        consecutive_errors = 0
+
+        while not self.stop_event.is_set():
+            try:
+                now_ts = time.time()
+                if now_ts - self.last_heartbeat >= HEARTBEAT_SECONDS:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Monitor alive: {self.wallet}")
+                    self.last_heartbeat = now_ts
+
+                trades = fetch_trades(self.api_key, self.wallet)
+                consecutive_errors = 0
+
+                if isinstance(trades, list) and len(trades) > 0:
+                    if self.last_seen_id is None:
+                        self.last_seen_id = pick_id(trades[0])
+                        state = load_state()
+                        state["last_seen_id"] = self.last_seen_id
+                        save_state(state)
+                    else:
+                        new_trades = []
+                        for tr in trades:
+                            if pick_id(tr) == self.last_seen_id:
+                                break
+                            new_trades.append(tr)
+
+                        for tr in reversed(new_trades):
+                            send_message(
+                                self.token, self.chat_id,
+                                format_trade_message(self.wallet, tr),
+                                parse_mode="Markdown"
+                            )
+                            self.daily = add_trade_to_daily(self.daily, tr)
+
+                        if new_trades:
+                            self.last_seen_id = pick_id(trades[0])
+                            state = load_state()
+                            state["last_seen_id"] = self.last_seen_id
+                            save_state(state)
+
+                # Daily summary lúc 23:59
+                now = datetime.now()
+                today_str = str(date.today())
+                if now.hour == 23 and now.minute >= 59 and self.last_summary_date != today_str:
+                    self.daily = load_daily()
+                    send_message(self.token, self.chat_id, build_daily_summary(self.wallet, self.daily))
+                    save_daily({"date": today_str, "total": 0, "markets": []})
+                    self.last_summary_date = today_str
+
+            except Exception as e:
+                print("⚠️ Poll error:", repr(e))
+                consecutive_errors += 1
+                if consecutive_errors == 10:
+                    send_message(self.token, self.chat_id,
+                        f"⚠️ Bot lỗi liên tục 10 lần!\nLỗi cuối: {repr(e)}")
+
+            self.stop_event.wait(POLL_SECONDS)
+
+        print(f"🛑 Monitor stopped: {self.wallet}")
+
+
+# ============================================================
+# BOT CONVERSATION STATE
+# ============================================================
+
+CHAT_STATE = {}
+monitor_thread: MonitorThread | None = None
+
+
+def get_chat_step(chat_id):
+    return CHAT_STATE.get(str(chat_id), {}).get("step")
+
+
+def set_chat_step(chat_id, step, data=None):
+    CHAT_STATE[str(chat_id)] = {"step": step, "data": data or {}}
+
+
+def clear_chat_step(chat_id):
+    CHAT_STATE.pop(str(chat_id), None)
+
+
+def start_monitoring(token, chat_id, api_key, wallet):
+    global monitor_thread
+    state = load_state()
+    state["last_seen_id"] = None
+    state["monitored_wallet"] = wallet
+    save_state(state)
+
+    if monitor_thread and monitor_thread.is_alive():
+        monitor_thread.stop()
+        monitor_thread.join(timeout=10)
+
+    monitor_thread = MonitorThread(token, chat_id, api_key, wallet)
+    monitor_thread.start()
+
+
+# ============================================================
+# HANDLE MESSAGES
+# ============================================================
+
+def handle_message(token, api_key, message):
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "").strip()
+
+    if text in ("/start", "/menu"):
+        clear_chat_step(chat_id)
+        send_main_menu(token, chat_id)
+        return
+
+    step = get_chat_step(chat_id)
+
+    # Chờ nhập EOA để find smart wallet
+    if step == "waiting_eoa":
+        eoa = text
+        send_message(token, chat_id,
+            f"🔍 Đang tìm smart wallet cho EOA:\n`{eoa}`\n\nVui lòng chờ 10-30 giây...",
+            parse_mode="Markdown")
+        clear_chat_step(chat_id)
+
+        smart_wallet = find_smart_wallet(eoa)
+
+        if smart_wallet:
+            send_message(
+                token, chat_id,
+                f"✅ Tìm thấy Smart Wallet!\n\nEOA: `{eoa}`\nSmart Wallet: `{smart_wallet}`",
+                reply_markup={
+                    "inline_keyboard": [
+                        [{"text": "👁 Monitor ví này", "callback_data": f"monitor_found:{smart_wallet}"}],
+                        [{"text": "🏠 Menu chính", "callback_data": "main_menu"}],
+                    ]
+                },
+                parse_mode="Markdown"
+            )
+        else:
+            send_message(
+                token, chat_id,
+                "❌ Không tìm thấy smart wallet cho EOA này.\n\nCó thể ví chưa từng dùng Opinion.",
+                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]}
+            )
+        return
+
+    # Chờ nhập smart wallet để monitor
+    if step == "waiting_smart_wallet":
+        wallet = text
+        clear_chat_step(chat_id)
+        start_monitoring(token, chat_id, api_key, wallet)
+        return
+
+    # Chờ nhập ví mới khi đang monitor ví cũ
+    if step == "waiting_new_wallet_for_change":
+        new_wallet = text
+        state = load_state()
+        current_wallet = state.get("monitored_wallet")
+        set_chat_step(chat_id, "confirm_change_wallet", {"new_wallet": new_wallet})
+        send_message(
+            token, chat_id,
+            f"⚠️ Đang monitor ví:\n`{current_wallet}`\n\nBạn có muốn chuyển sang monitor ví mới không?\n`{new_wallet}`\n\nGõ *có* để xác nhận, *không* để giữ nguyên.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Chờ xác nhận đổi ví
+    if step == "confirm_change_wallet":
+        if text.lower() in ("có", "co", "yes", "y"):
+            new_wallet = CHAT_STATE.get(str(chat_id), {}).get("data", {}).get("new_wallet")
+            clear_chat_step(chat_id)
+            if new_wallet:
+                start_monitoring(token, chat_id, api_key, new_wallet)
+        else:
+            clear_chat_step(chat_id)
+            send_message(token, chat_id, "✅ Giữ nguyên ví đang monitor.",
+                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+        return
+
+    send_message(token, chat_id, "Dùng /start để mở menu nhé!",
+        reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+
+
+# ============================================================
+# HANDLE CALLBACKS
+# ============================================================
+
+def handle_callback(token, api_key, callback_query):
+    global monitor_thread
+
+    chat_id = callback_query["message"]["chat"]["id"]
+    message_id = callback_query["message"]["message_id"]
+    data = callback_query.get("data", "")
+    cq_id = callback_query["id"]
+
+    answer_callback(token, cq_id)
+
+    if data == "main_menu":
+        clear_chat_step(chat_id)
+        edit_message(token, chat_id, message_id,
+            "👋 Chào mừng! Chọn tính năng bạn muốn dùng:",
+            reply_markup=MAIN_MENU_MARKUP)
+        return
+
+    if data == "copy_trade":
+        edit_message(token, chat_id, message_id,
+            "🤖 Tính năng Copy Trade đang được phát triển...\n\nVui lòng quay lại sau!",
+            reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+        return
+
+    if data == "find_wallet":
+        clear_chat_step(chat_id)
+        set_chat_step(chat_id, "waiting_eoa")
+        edit_message(token, chat_id, message_id,
+            "🔍 *Find Smart Wallet*\n\nNhập địa chỉ EOA wallet (ví gốc) của trader muốn tìm:",
+            reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+        return
+
+    if data == "monitor_wallet":
+        clear_chat_step(chat_id)
+        state = load_state()
+        current_wallet = state.get("monitored_wallet")
+
+        if current_wallet and monitor_thread and monitor_thread.is_alive():
+            set_chat_step(chat_id, "waiting_new_wallet_for_change")
+            edit_message(token, chat_id, message_id,
+                f"👁 Đang monitor ví:\n`{current_wallet}`\n\nNhập ví smart wallet mới muốn monitor:",
+                reply_markup={"inline_keyboard": [[{"text": "🏠 Hủy bỏ", "callback_data": "main_menu"}]]})
+        else:
+            set_chat_step(chat_id, "waiting_smart_wallet")
+            edit_message(token, chat_id, message_id,
+                "👁 *Monitor Wallet*\n\nNhập địa chỉ Smart Wallet muốn monitor:",
+                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+        return
+
+    if data.startswith("monitor_found:"):
+        wallet = data.split("monitor_found:")[1]
+        state = load_state()
+        current_wallet = state.get("monitored_wallet")
+
+        if current_wallet and monitor_thread and monitor_thread.is_alive():
+            set_chat_step(chat_id, "confirm_change_wallet", {"new_wallet": wallet})
+            send_message(token, chat_id,
+                f"⚠️ Đang monitor ví:\n`{current_wallet}`\n\nBạn có muốn chuyển sang monitor ví mới không?\n`{wallet}`\n\nGõ *có* để xác nhận, *không* để giữ nguyên.",
+                parse_mode="Markdown")
+        else:
+            start_monitoring(token, chat_id, api_key, wallet)
+        return
+
+
+# ============================================================
+# TELEGRAM UPDATE LOOP
+# ============================================================
+
+def run_bot(token, api_key):
+    print("🤖 Bot started, polling Telegram updates...")
+    offset = 0
+
+    while True:
+        try:
+            resp = requests.get(
+                TG_BASE.format(token=token, method="getUpdates"),
+                params={"offset": offset, "timeout": 30},
+                timeout=40
+            )
+            updates = resp.json().get("result", [])
+
+            for update in updates:
+                offset = update["update_id"] + 1
+                if "message" in update:
+                    handle_message(token, api_key, update["message"])
+                elif "callback_query" in update:
+                    handle_callback(token, api_key, update["callback_query"])
+
+        except Exception as e:
+            print("⚠️ Update loop error:", repr(e))
+            time.sleep(5)
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
     load_dotenv()
 
-    tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    tg_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
     api_key = os.getenv("OPINION_API_KEY")
-    wallet = os.getenv("SMART_WALLET")
 
-    if not all([tg_token, tg_chat_id, api_key, wallet]):
-        print("❌ Thiếu TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / OPINION_API_KEY / SMART_WALLET trong .env")
+    missing = []
+    for name, val in [
+        ("TELEGRAM_BOT_TOKEN", token),
+        ("OPINION_API_KEY", api_key),
+    ]:
+        if not val:
+            missing.append(name)
+
+    if missing:
+        for m in missing:
+            print(f"❌ Thiếu biến môi trường: {m}")
         return
 
-    print("🚀 Bot started. Polling trades...")
-    last_seen_id = None
-    daily = load_daily()
-
-    last_heartbeat_print = 0
-    last_summary_sent_date = None
-
-    while True:
-        try:
-            # In trạng thái mỗi 1 tiếng
-            now_ts = time.time()
-            if now_ts - last_heartbeat_print >= HEARTBEAT_PRINT_SECONDS:
-                now_str = datetime.now().strftime("%H:%M:%S")
-                print(f"[{now_str}] Still running...")
-                last_heartbeat_print = now_ts
-
-            trades = fetch_trades(api_key, wallet)
-
-            if isinstance(trades, list) and len(trades) > 0:
-                if last_seen_id is None:
-                    # Lần đầu chạy: set mốc, không spam lịch sử
-                    last_seen_id = pick_id(trades[0])
-                else:
-                    new_trades = []
-                    for tr in trades:
-                        if pick_id(tr) == last_seen_id:
-                            break
-                        new_trades.append(tr)
-
-                    if new_trades:
-                        # gửi theo thứ tự cũ -> mới
-                        for tr in reversed(new_trades):
-                            send_telegram(tg_token, tg_chat_id, format_trade_message(wallet, tr))
-                            daily = add_trade_to_daily(daily, tr)
-
-                        last_seen_id = pick_id(trades[0])
-
-            # Daily summary lúc 23:59 (giờ máy)
-            now = datetime.now()
-            today_str = str(date.today())
-            if now.hour == 23 and now.minute == 59:
-                if last_summary_sent_date != today_str:
-                    daily = load_daily()
-                    send_telegram(tg_token, tg_chat_id, build_daily_summary(wallet, daily))
-
-                    # Reset file cho ngày tiếp theo
-                    save_daily({"date": str(date.today()), "total": 0, "markets": []})
-                    last_summary_sent_date = today_str
-
-        except Exception as e:
-            # Không spam Telegram lỗi, chỉ in ra CMD
-            # (nếu bạn muốn gửi lỗi Telegram khi lỗi liên tục, mình cũng thêm được)
-            print("⚠️ Lỗi khi poll:", repr(e))
-
-        time.sleep(POLL_SECONDS)
+    print("✅ Config loaded. Starting bot...")
+    run_bot(token, api_key)
 
 
 if __name__ == "__main__":
