@@ -17,18 +17,15 @@ HEARTBEAT_SECONDS = 3600
 DAILY_FILE = "daily_summary.json"
 STATE_FILE = "state.json"
 
-# Opinion Safe Proxy Factory contract
 SAFE_PROXY_FACTORY = "0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2"
 
-# Moralis API
 MORALIS_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjY3NWUwMGY4LTdiMTYtNDRiMS04ZWMyLTc0ZWU5ODg4NDkwZCIsIm9yZ0lkIjoiNTAxOTg4IiwidXNlcklkIjoiNTE2NTIzIiwidHlwZUlkIjoiYmZlOTMyYjQtZWM2My00NzFmLTk5YzktNTJiMjJlNjFlMDQ4IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NzE4NjEzNzIsImV4cCI6NDkyNzYyMTM3Mn0.fJE8A3LO4FYDmC967VWOab6W4uREUUumm84XYaFWkh8"
 
-# Telegram API base
 TG_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
 # ============================================================
-# FIND SMART WALLET (Moralis API - endpoint đúng)
+# FIND SMART WALLET
 # ============================================================
 
 def find_smart_wallet(eoa_address: str) -> str | None:
@@ -39,7 +36,6 @@ def find_smart_wallet(eoa_address: str) -> str | None:
     }
 
     try:
-        # Lấy danh sách tx của EOA
         url = f"https://deep-index.moralis.io/api/v2/{eoa_address}"
         params = {"chain": "bsc", "limit": 100}
         print(f"  Đang lấy tx list từ Moralis...")
@@ -49,14 +45,11 @@ def find_smart_wallet(eoa_address: str) -> str | None:
         txs = data.get("result", [])
         print(f"  Tìm thấy {len(txs)} tx")
 
-        # Lọc tx gửi tới factory
         factory_txs = [
             tx for tx in txs
             if (tx.get("to_address") or "").lower() == factory_lower
         ]
-        print(f"  Tx tới factory: {len(factory_txs)}")
 
-        # Nếu không thấy, thử trang tiếp
         cursor = data.get("cursor")
         page = 1
         while not factory_txs and cursor and page < 5:
@@ -71,27 +64,25 @@ def find_smart_wallet(eoa_address: str) -> str | None:
             cursor = data2.get("cursor")
             page += 1
 
+        print(f"  Tx tới factory: {len(factory_txs)}")
+
         if not factory_txs:
             print("  ❌ Không tìm thấy tx nào tới factory")
             return None
 
-        # Đọc receipt để lấy địa chỉ smart wallet từ log
         for tx in factory_txs:
             tx_hash = tx["hash"]
-            print(f"  Đang đọc receipt: {tx_hash[:20]}...")
+            print(f"  Đang đọc tx: {tx_hash[:20]}...")
 
-            receipt_url = f"https://deep-index.moralis.io/api/v2/transaction/{tx_hash}/receipt"
-            receipt_resp = requests.get(
-                receipt_url,
-                headers=headers,
-                params={"chain": "bsc"},
-                timeout=30
-            )
-            receipt = receipt_resp.json()
-            logs = receipt.get("logs", []) if isinstance(receipt, dict) else []
+            tx_url = f"https://deep-index.moralis.io/api/v2/transaction/{tx_hash}"
+            tx_resp = requests.get(tx_url, headers=headers, params={"chain": "bsc"}, timeout=30)
+            tx_data = tx_resp.json()
+
+            logs = tx_data.get("logs", []) if isinstance(tx_data, dict) else []
 
             for log in logs:
-                if (log.get("address") or "").lower() == factory_lower:
+                log_address = (log.get("address") or "").lower()
+                if log_address == factory_lower:
                     log_data = (log.get("data") or "").replace("0x", "")
                     if len(log_data) >= 64:
                         proxy_address = "0x" + log_data[24:64]
@@ -410,6 +401,23 @@ def start_monitoring(token, chat_id, api_key, wallet):
     monitor_thread.start()
 
 
+def ask_confirm_change(token, chat_id, current_wallet, new_wallet):
+    """Hiển thị nút Có / Không khi đổi ví monitor"""
+    send_message(
+        token, chat_id,
+        f"⚠️ Đang monitor ví:\n`{current_wallet}`\n\nBạn có muốn chuyển sang monitor ví mới không?\n`{new_wallet}`",
+        reply_markup={
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Có, đổi ví",   "callback_data": f"confirm_change:{new_wallet}"},
+                    {"text": "❌ Không, giữ nguyên", "callback_data": "cancel_change"},
+                ]
+            ]
+        },
+        parse_mode="Markdown"
+    )
+
+
 # ============================================================
 # HANDLE MESSAGES
 # ============================================================
@@ -425,6 +433,7 @@ def handle_message(token, api_key, message):
 
     step = get_chat_step(chat_id)
 
+    # Chờ nhập EOA
     if step == "waiting_eoa":
         eoa = text
         send_message(token, chat_id,
@@ -435,17 +444,29 @@ def handle_message(token, api_key, message):
         smart_wallet = find_smart_wallet(eoa)
 
         if smart_wallet:
-            send_message(
-                token, chat_id,
-                f"✅ Tìm thấy Smart Wallet!\n\nEOA: `{eoa}`\nSmart Wallet: `{smart_wallet}`",
-                reply_markup={
-                    "inline_keyboard": [
-                        [{"text": "👁 Monitor ví này", "callback_data": f"monitor_found:{smart_wallet}"}],
-                        [{"text": "🏠 Menu chính", "callback_data": "main_menu"}],
-                    ]
-                },
-                parse_mode="Markdown"
-            )
+            state = load_state()
+            current_wallet = state.get("monitored_wallet")
+
+            # Nếu đang monitor ví khác → hỏi xác nhận bằng nút
+            if current_wallet and monitor_thread and monitor_thread.is_alive():
+                send_message(
+                    token, chat_id,
+                    f"✅ Tìm thấy Smart Wallet!\n\nEOA: `{eoa}`\nSmart Wallet: `{smart_wallet}`",
+                    parse_mode="Markdown"
+                )
+                ask_confirm_change(token, chat_id, current_wallet, smart_wallet)
+            else:
+                send_message(
+                    token, chat_id,
+                    f"✅ Tìm thấy Smart Wallet!\n\nEOA: `{eoa}`\nSmart Wallet: `{smart_wallet}`",
+                    reply_markup={
+                        "inline_keyboard": [
+                            [{"text": "👁 Monitor ví này", "callback_data": f"monitor_found:{smart_wallet}"}],
+                            [{"text": "🏠 Menu chính", "callback_data": "main_menu"}],
+                        ]
+                    },
+                    parse_mode="Markdown"
+                )
         else:
             send_message(
                 token, chat_id,
@@ -454,34 +475,17 @@ def handle_message(token, api_key, message):
             )
         return
 
+    # Chờ nhập smart wallet để monitor
     if step == "waiting_smart_wallet":
         wallet = text
         clear_chat_step(chat_id)
-        start_monitoring(token, chat_id, api_key, wallet)
-        return
-
-    if step == "waiting_new_wallet_for_change":
-        new_wallet = text
         state = load_state()
         current_wallet = state.get("monitored_wallet")
-        set_chat_step(chat_id, "confirm_change_wallet", {"new_wallet": new_wallet})
-        send_message(
-            token, chat_id,
-            f"⚠️ Đang monitor ví:\n`{current_wallet}`\n\nBạn có muốn chuyển sang monitor ví mới không?\n`{new_wallet}`\n\nGõ *có* để xác nhận, *không* để giữ nguyên.",
-            parse_mode="Markdown"
-        )
-        return
 
-    if step == "confirm_change_wallet":
-        if text.lower() in ("có", "co", "yes", "y"):
-            new_wallet = CHAT_STATE.get(str(chat_id), {}).get("data", {}).get("new_wallet")
-            clear_chat_step(chat_id)
-            if new_wallet:
-                start_monitoring(token, chat_id, api_key, new_wallet)
+        if current_wallet and monitor_thread and monitor_thread.is_alive():
+            ask_confirm_change(token, chat_id, current_wallet, wallet)
         else:
-            clear_chat_step(chat_id)
-            send_message(token, chat_id, "✅ Giữ nguyên ví đang monitor.",
-                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+            start_monitoring(token, chat_id, api_key, wallet)
         return
 
     send_message(token, chat_id, "Dùng /start để mở menu nhé!",
@@ -525,33 +529,42 @@ def handle_callback(token, api_key, callback_query):
 
     if data == "monitor_wallet":
         clear_chat_step(chat_id)
+        set_chat_step(chat_id, "waiting_smart_wallet")
         state = load_state()
         current_wallet = state.get("monitored_wallet")
 
         if current_wallet and monitor_thread and monitor_thread.is_alive():
-            set_chat_step(chat_id, "waiting_new_wallet_for_change")
             edit_message(token, chat_id, message_id,
                 f"👁 Đang monitor ví:\n`{current_wallet}`\n\nNhập ví smart wallet mới muốn monitor:",
                 reply_markup={"inline_keyboard": [[{"text": "🏠 Hủy bỏ", "callback_data": "main_menu"}]]})
         else:
-            set_chat_step(chat_id, "waiting_smart_wallet")
             edit_message(token, chat_id, message_id,
                 "👁 *Monitor Wallet*\n\nNhập địa chỉ Smart Wallet muốn monitor:",
                 reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
         return
 
+    # Monitor ví vừa find (khi chưa có ví nào đang monitor)
     if data.startswith("monitor_found:"):
         wallet = data.split("monitor_found:")[1]
-        state = load_state()
-        current_wallet = state.get("monitored_wallet")
+        start_monitoring(token, chat_id, api_key, wallet)
+        return
 
-        if current_wallet and monitor_thread and monitor_thread.is_alive():
-            set_chat_step(chat_id, "confirm_change_wallet", {"new_wallet": wallet})
-            send_message(token, chat_id,
-                f"⚠️ Đang monitor ví:\n`{current_wallet}`\n\nBạn có muốn chuyển sang monitor ví mới không?\n`{wallet}`\n\nGõ *có* để xác nhận, *không* để giữ nguyên.",
-                parse_mode="Markdown")
-        else:
-            start_monitoring(token, chat_id, api_key, wallet)
+    # Xác nhận đổi ví → bấm nút Có
+    if data.startswith("confirm_change:"):
+        new_wallet = data.split("confirm_change:")[1]
+        clear_chat_step(chat_id)
+        edit_message(token, chat_id, message_id,
+            f"✅ Đang chuyển sang monitor ví mới:\n`{new_wallet}`",
+            parse_mode=None)
+        start_monitoring(token, chat_id, api_key, new_wallet)
+        return
+
+    # Hủy đổi ví → bấm nút Không
+    if data == "cancel_change":
+        clear_chat_step(chat_id)
+        edit_message(token, chat_id, message_id,
+            "✅ Giữ nguyên ví đang monitor.",
+            reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
         return
 
 
