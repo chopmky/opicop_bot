@@ -20,60 +20,82 @@ STATE_FILE = "state.json"
 # Opinion Safe Proxy Factory contract
 SAFE_PROXY_FACTORY = "0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2"
 
+# Moralis API
+MORALIS_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjY3NWUwMGY4LTdiMTYtNDRiMS04ZWMyLTc0ZWU5ODg4NDkwZCIsIm9yZ0lkIjoiNTAxOTg4IiwidXNlcklkIjoiNTE2NTIzIiwidHlwZUlkIjoiYmZlOTMyYjQtZWM2My00NzFmLTk5YzktNTJiMjJlNjFlMDQ4IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NzE4NjEzNzIsImV4cCI6NDkyNzYyMTM3Mn0.fJE8A3LO4FYDmC967VWOab6W4uREUUumm84XYaFWkh8"
+
 # Telegram API base
 TG_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
 # ============================================================
-# FIND SMART WALLET (scrape BscScan, không cần API key)
+# FIND SMART WALLET (Moralis API - endpoint đúng)
 # ============================================================
 
 def find_smart_wallet(eoa_address: str) -> str | None:
-    """
-    Scrape BscScan để tìm smart wallet của EOA.
-    Tìm transaction tới Safe Proxy Factory, đọc địa chỉ contract được tạo.
-    """
-    eoa = eoa_address.lower()
     factory_lower = SAFE_PROXY_FACTORY.lower()
-
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        "accept": "application/json",
+        "X-API-Key": MORALIS_API_KEY,
     }
 
     try:
-        # Lấy danh sách tx của EOA từ BscScan
-        url = f"https://bscscan.com/txs?a={eoa}&f=2"
-        print(f"  Đang lấy danh sách tx: {url}")
-        resp = requests.get(url, headers=headers, timeout=30)
-        html = resp.text
+        # Lấy danh sách tx của EOA
+        url = f"https://deep-index.moralis.io/api/v2/{eoa_address}"
+        params = {"chain": "bsc", "limit": 100}
+        print(f"  Đang lấy tx list từ Moralis...")
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        data = resp.json()
 
-        # Tìm tất cả tx hash trong trang
-        tx_hashes = re.findall(r'href="/tx/(0x[a-fA-F0-9]{64})"', html)
-        print(f"  Tìm thấy {len(tx_hashes)} tx trong trang")
+        txs = data.get("result", [])
+        print(f"  Tìm thấy {len(txs)} tx")
 
-        for tx_hash in tx_hashes:
-            tx_url = f"https://bscscan.com/tx/{tx_hash}"
-            print(f"  Kiểm tra tx: {tx_hash[:20]}...")
-            tx_resp = requests.get(tx_url, headers=headers, timeout=30)
-            tx_html = tx_resp.text
+        # Lọc tx gửi tới factory
+        factory_txs = [
+            tx for tx in txs
+            if (tx.get("to_address") or "").lower() == factory_lower
+        ]
+        print(f"  Tx tới factory: {len(factory_txs)}")
 
-            if factory_lower in tx_html.lower():
-                print(f"  ✅ Tìm thấy tx tới factory!")
-                # Tìm địa chỉ contract được tạo (Created)
-                created = re.findall(
-                    r'Created\s*\]\s*<[^>]*>\s*<[^>]*href="/address/(0x[a-fA-F0-9]{40})"',
-                    tx_html, re.DOTALL
-                )
-                if not created:
-                    # Thử pattern khác
-                    created = re.findall(
-                        r'\[.*?Created.*?\].*?/address/(0x[a-fA-F0-9]{40})',
-                        tx_html, re.DOTALL
-                    )
-                if created:
-                    return Web3.to_checksum_address(created[0])
+        # Nếu không thấy, thử trang tiếp
+        cursor = data.get("cursor")
+        page = 1
+        while not factory_txs and cursor and page < 5:
+            params["cursor"] = cursor
+            resp2 = requests.get(url, headers=headers, params=params, timeout=30)
+            data2 = resp2.json()
+            more_txs = data2.get("result", [])
+            factory_txs = [
+                tx for tx in more_txs
+                if (tx.get("to_address") or "").lower() == factory_lower
+            ]
+            cursor = data2.get("cursor")
+            page += 1
 
-            time.sleep(0.5)  # tránh bị block
+        if not factory_txs:
+            print("  ❌ Không tìm thấy tx nào tới factory")
+            return None
+
+        # Đọc receipt để lấy địa chỉ smart wallet từ log
+        for tx in factory_txs:
+            tx_hash = tx["hash"]
+            print(f"  Đang đọc receipt: {tx_hash[:20]}...")
+
+            receipt_url = f"https://deep-index.moralis.io/api/v2/transaction/{tx_hash}/receipt"
+            receipt_resp = requests.get(
+                receipt_url,
+                headers=headers,
+                params={"chain": "bsc"},
+                timeout=30
+            )
+            receipt = receipt_resp.json()
+            logs = receipt.get("logs", []) if isinstance(receipt, dict) else []
+
+            for log in logs:
+                if (log.get("address") or "").lower() == factory_lower:
+                    log_data = (log.get("data") or "").replace("0x", "")
+                    if len(log_data) >= 64:
+                        proxy_address = "0x" + log_data[24:64]
+                        return Web3.to_checksum_address(proxy_address)
 
     except Exception as e:
         print("❌ find_smart_wallet error:", repr(e))
@@ -333,7 +355,6 @@ class MonitorThread(threading.Thread):
                             state["last_seen_id"] = self.last_seen_id
                             save_state(state)
 
-                # Daily summary lúc 23:59
                 now = datetime.now()
                 today_str = str(date.today())
                 if now.hour == 23 and now.minute >= 59 and self.last_summary_date != today_str:
@@ -404,11 +425,10 @@ def handle_message(token, api_key, message):
 
     step = get_chat_step(chat_id)
 
-    # Chờ nhập EOA để find smart wallet
     if step == "waiting_eoa":
         eoa = text
         send_message(token, chat_id,
-            f"🔍 Đang tìm smart wallet cho EOA:\n`{eoa}`\n\nVui lòng chờ 10-30 giây...",
+            f"🔍 Đang tìm smart wallet cho EOA:\n`{eoa}`\n\nVui lòng chờ...",
             parse_mode="Markdown")
         clear_chat_step(chat_id)
 
@@ -434,14 +454,12 @@ def handle_message(token, api_key, message):
             )
         return
 
-    # Chờ nhập smart wallet để monitor
     if step == "waiting_smart_wallet":
         wallet = text
         clear_chat_step(chat_id)
         start_monitoring(token, chat_id, api_key, wallet)
         return
 
-    # Chờ nhập ví mới khi đang monitor ví cũ
     if step == "waiting_new_wallet_for_change":
         new_wallet = text
         state = load_state()
@@ -454,7 +472,6 @@ def handle_message(token, api_key, message):
         )
         return
 
-    # Chờ xác nhận đổi ví
     if step == "confirm_change_wallet":
         if text.lower() in ("có", "co", "yes", "y"):
             new_wallet = CHAT_STATE.get(str(chat_id), {}).get("data", {}).get("new_wallet")
