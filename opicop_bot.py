@@ -96,11 +96,11 @@ def find_smart_wallet(eoa_address: str) -> str | None:
 
 
 # ============================================================
-# FETCH POSITIONS
+# FETCH POSITIONS (dùng EOA)
 # ============================================================
 
-def fetch_positions(api_key: str, wallet: str) -> str:
-    url = OPINION_POSITIONS_URL.format(wallet=wallet)
+def fetch_positions(api_key: str, eoa: str) -> str:
+    url = OPINION_POSITIONS_URL.format(wallet=eoa)
     headers = {"apikey": api_key}
 
     try:
@@ -108,23 +108,37 @@ def fetch_positions(api_key: str, wallet: str) -> str:
         resp.raise_for_status()
         data = resp.json()
 
-        positions = data.get("data", data) if isinstance(data, dict) else data
+        result = data.get("result", {})
+        positions = result.get("list", [])
 
-        if not positions or not isinstance(positions, list) or len(positions) == 0:
-            return f"📭 Ví `{wallet[:10]}...` không có position nào."
+        if not positions:
+            return "📭 Ví không có position nào đang mở."
 
-        lines = [f"📊 Positions của ví `{wallet[:10]}...`\n"]
+        lines = [f"📊 *Positions ({len(positions)} vị thế)*\n"]
         for i, p in enumerate(positions, 1):
-            market = p.get("marketTitle") or p.get("marketName") or p.get("title") or f"Market {p.get('marketId', '?')}"
-            outcome = "YES" if str(p.get("outcomeSide", "")) == "1" else "NO" if str(p.get("outcomeSide", "")) == "2" else str(p.get("outcomeSide", "?"))
-            shares = p.get("shares") or p.get("amount") or "?"
-            value = p.get("currentValue") or p.get("value") or p.get("usdValue") or "?"
-            pnl = p.get("pnl") or p.get("unrealizedPnl") or ""
+            root_market = p.get("rootMarketTitle") or p.get("marketTitle") or f"Market {p.get('marketId', '?')}"
+            sub_market = p.get("marketTitle") or ""
+            outcome = "YES" if p.get("outcomeSide") == 1 else "NO"
+            shares = p.get("sharesOwned") or "?"
+            value = p.get("currentValueInQuoteToken") or "?"
+            avg_cost = p.get("avgEntryPrice") or "?"
+            pnl = p.get("unrealizedPnl") or "0"
+            pnl_pct = p.get("unrealizedPnlPercent") or "0"
 
-            lines.append(f"{i}. *{market[:50]}*")
-            lines.append(f"   {outcome} | Shares: {shares} | Value: {value}")
-            if pnl:
-                lines.append(f"   PnL: {pnl}")
+            try:
+                pnl_float = float(pnl)
+                pnl_pct_float = float(pnl_pct) * 100
+                pnl_str = f"+${pnl_float:.2f}" if pnl_float >= 0 else f"-${abs(pnl_float):.2f}"
+                pnl_pct_str = f"+{pnl_pct_float:.1f}%" if pnl_pct_float >= 0 else f"{pnl_pct_float:.1f}%"
+            except Exception:
+                pnl_str = str(pnl)
+                pnl_pct_str = str(pnl_pct)
+
+            lines.append(f"{i}. *{root_market}*")
+            if sub_market and sub_market != root_market:
+                lines.append(f"   📅 {sub_market}")
+            lines.append(f"   {outcome} | Shares: {shares} | Value: ${value}")
+            lines.append(f"   Avg Cost: {avg_cost}¢ | PnL: {pnl_str} ({pnl_pct_str})")
 
         return "\n".join(lines)
 
@@ -176,7 +190,6 @@ def edit_message(token, chat_id, message_id, text, reply_markup=None):
 
 MAIN_MENU_MARKUP = {
     "inline_keyboard": [
-        [{"text": "🔍 Find Smart Wallet", "callback_data": "find_wallet"}],
         [{"text": "👁 Monitor Wallet",    "callback_data": "monitor_wallet"}],
         [{"text": "📊 Xem Positions",     "callback_data": "view_positions"}],
         [{"text": "🤖 Copy Trade",        "callback_data": "copy_trade"}],
@@ -259,10 +272,10 @@ def build_daily_summary(wallet, daily):
     total = daily.get("total", 0)
     markets = daily.get("markets", [])
     lines = [
-        f"📊 Daily Summary ({d})",
-        f"Wallet: {wallet}",
-        f"Total executed trades: {total}",
-        "Markets traded today:",
+        f"*Daily Summary* ({d})",
+        f"Ví đang monitor: {wallet}",
+        f"Tổng lệnh trade: {total}",
+        "Markets đã traded:",
     ]
     for m in (markets or ["(none)"]):
         lines.append(f"- {m}")
@@ -343,7 +356,7 @@ class MonitorThread(threading.Thread):
         print(f"🚀 Monitor started: {self.wallet}")
         send_message(
             self.token, self.chat_id,
-            f"👁 Bắt đầu monitor ví:\n`{self.wallet}`",
+            f"*Bắt đầu monitor ví:*\n`{self.wallet}`",
             parse_mode="Markdown"
         )
         consecutive_errors = 0
@@ -417,11 +430,12 @@ def clear_chat_step(chat_id):
     CHAT_STATE.pop(str(chat_id), None)
 
 
-def start_monitoring(token, chat_id, api_key, wallet):
+def start_monitoring(token, chat_id, api_key, smart_wallet, eoa):
     global monitor_thread
     state = load_state()
     state["last_seen_id"] = None
-    state["monitored_wallet"] = wallet
+    state["monitored_wallet"] = smart_wallet
+    state["monitored_eoa"] = eoa
     state["chat_id"] = str(chat_id)
     save_state(state)
 
@@ -429,24 +443,52 @@ def start_monitoring(token, chat_id, api_key, wallet):
         monitor_thread.stop()
         monitor_thread.join(timeout=10)
 
-    monitor_thread = MonitorThread(token, chat_id, api_key, wallet)
+    monitor_thread = MonitorThread(token, chat_id, api_key, smart_wallet)
     monitor_thread.start()
 
 
-def ask_confirm_change(token, chat_id, current_wallet, new_wallet):
-    send_message(
-        token, chat_id,
-        f"⚠️ Đang monitor ví:\n`{current_wallet}`\n\nBạn có muốn chuyển sang monitor ví mới không?\n`{new_wallet}`",
-        reply_markup={
-            "inline_keyboard": [
-                [
-                    {"text": "✅ Có, đổi ví", "callback_data": f"confirm_change:{new_wallet}"},
-                    {"text": "❌ Không, giữ nguyên", "callback_data": "cancel_change"},
+def do_find_and_monitor(token, chat_id, api_key, eoa):
+    """Tìm smart wallet từ EOA rồi bắt đầu monitor"""
+    send_message(token, chat_id,
+        f"🔍 Đang tìm smart wallet cho:\n`{eoa}`\n\nVui lòng chờ...",
+        parse_mode="Markdown")
+
+    smart_wallet = find_smart_wallet(eoa)
+
+    if not smart_wallet:
+        send_message(token, chat_id,
+            "❌ Không tìm thấy smart wallet cho EOA này.\n\nCó thể ví chưa từng dùng Opinion.",
+            reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]}
+        )
+        return
+
+    state = load_state()
+    current_wallet = state.get("monitored_wallet")
+
+    if current_wallet and monitor_thread and monitor_thread.is_alive():
+        # Đang monitor ví khác → hỏi xác nhận
+        send_message(token, chat_id,
+            f"✅ Tìm thấy Smart Wallet!\n\nEOA: `{eoa}`\nSmart Wallet: `{smart_wallet}`",
+            parse_mode="Markdown")
+        send_message(
+            token, chat_id,
+            f"⚠️ Đang monitor ví:\n`{current_wallet}`\n\nBạn có muốn chuyển sang monitor ví mới không?\n`{smart_wallet}`",
+            reply_markup={
+                "inline_keyboard": [
+                    [
+                        {"text": "✅ Có, đổi ví", "callback_data": f"confirm_change:{smart_wallet}|{eoa}"},
+                        {"text": "❌ Không, giữ nguyên", "callback_data": "cancel_change"},
+                    ]
                 ]
-            ]
-        },
-        parse_mode="Markdown"
-    )
+            },
+            parse_mode="Markdown"
+        )
+    else:
+        # Chưa monitor ví nào → monitor luôn
+        send_message(token, chat_id,
+            f"✅ Tìm thấy Smart Wallet!\n\nEOA: `{eoa}`\nSmart Wallet: `{smart_wallet}`",
+            parse_mode="Markdown")
+        start_monitoring(token, chat_id, api_key, smart_wallet, eoa)
 
 
 # ============================================================
@@ -464,9 +506,9 @@ def handle_message(token, api_key, message):
 
     if text == "/positions":
         state = load_state()
-        wallet = state.get("monitored_wallet")
-        if wallet:
-            msg = fetch_positions(api_key, wallet)
+        eoa = state.get("monitored_eoa")
+        if eoa:
+            msg = fetch_positions(api_key, eoa)
             send_message(token, chat_id, msg, parse_mode="Markdown",
                 reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
         else:
@@ -476,52 +518,11 @@ def handle_message(token, api_key, message):
 
     step = get_chat_step(chat_id)
 
+    # Tất cả flow nhập ví đều dùng EOA
     if step == "waiting_eoa":
         eoa = text
-        send_message(token, chat_id,
-            f"🔍 Đang tìm smart wallet cho EOA:\n`{eoa}`\n\nVui lòng chờ...",
-            parse_mode="Markdown")
         clear_chat_step(chat_id)
-
-        smart_wallet = find_smart_wallet(eoa)
-
-        if smart_wallet:
-            state = load_state()
-            current_wallet = state.get("monitored_wallet")
-
-            if current_wallet and monitor_thread and monitor_thread.is_alive():
-                send_message(token, chat_id,
-                    f"✅ Tìm thấy Smart Wallet!\n\nEOA: `{eoa}`\nSmart Wallet: `{smart_wallet}`",
-                    parse_mode="Markdown")
-                ask_confirm_change(token, chat_id, current_wallet, smart_wallet)
-            else:
-                send_message(token, chat_id,
-                    f"✅ Tìm thấy Smart Wallet!\n\nEOA: `{eoa}`\nSmart Wallet: `{smart_wallet}`",
-                    reply_markup={
-                        "inline_keyboard": [
-                            [{"text": "👁 Monitor ví này", "callback_data": f"monitor_found:{smart_wallet}"}],
-                            [{"text": "🏠 Menu chính", "callback_data": "main_menu"}],
-                        ]
-                    },
-                    parse_mode="Markdown"
-                )
-        else:
-            send_message(token, chat_id,
-                "❌ Không tìm thấy smart wallet cho EOA này.\n\nCó thể ví chưa từng dùng Opinion.",
-                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]}
-            )
-        return
-
-    if step == "waiting_smart_wallet":
-        wallet = text
-        clear_chat_step(chat_id)
-        state = load_state()
-        current_wallet = state.get("monitored_wallet")
-
-        if current_wallet and monitor_thread and monitor_thread.is_alive():
-            ask_confirm_change(token, chat_id, current_wallet, wallet)
-        else:
-            start_monitoring(token, chat_id, api_key, wallet)
+        do_find_and_monitor(token, chat_id, api_key, eoa)
         return
 
     send_message(token, chat_id, "Dùng /start để mở menu nhé!",
@@ -557,10 +558,10 @@ def handle_callback(token, api_key, callback_query):
 
     if data == "view_positions":
         state = load_state()
-        wallet = state.get("monitored_wallet")
-        if wallet:
+        eoa = state.get("monitored_eoa")
+        if eoa:
             edit_message(token, chat_id, message_id, "⏳ Đang lấy positions...")
-            msg = fetch_positions(api_key, wallet)
+            msg = fetch_positions(api_key, eoa)
             edit_message(token, chat_id, message_id, msg,
                 reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
         else:
@@ -569,41 +570,32 @@ def handle_callback(token, api_key, callback_query):
                 reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
         return
 
-    if data == "find_wallet":
-        clear_chat_step(chat_id)
-        set_chat_step(chat_id, "waiting_eoa")
-        edit_message(token, chat_id, message_id,
-            "🔍 *Find Smart Wallet*\n\nNhập địa chỉ EOA wallet (ví gốc) của trader muốn tìm:",
-            reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
-        return
-
     if data == "monitor_wallet":
         clear_chat_step(chat_id)
-        set_chat_step(chat_id, "waiting_smart_wallet")
+        set_chat_step(chat_id, "waiting_eoa")
         state = load_state()
         current_wallet = state.get("monitored_wallet")
 
         if current_wallet and monitor_thread and monitor_thread.is_alive():
             edit_message(token, chat_id, message_id,
-                f"👁 Đang monitor ví:\n`{current_wallet}`\n\nNhập ví smart wallet mới muốn monitor:",
+                f"👁 Đang monitor ví:\n`{current_wallet}`\n\nNhập EOA wallet mới muốn monitor:",
                 reply_markup={"inline_keyboard": [[{"text": "🏠 Hủy bỏ", "callback_data": "main_menu"}]]})
         else:
             edit_message(token, chat_id, message_id,
-                "👁 *Monitor Wallet*\n\nNhập địa chỉ Smart Wallet muốn monitor:",
+                "👁 *Monitor Wallet*\n\nNhập địa chỉ EOA wallet muốn monitor:",
                 reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
         return
 
-    if data.startswith("monitor_found:"):
-        wallet = data.split("monitor_found:")[1]
-        start_monitoring(token, chat_id, api_key, wallet)
-        return
-
     if data.startswith("confirm_change:"):
-        new_wallet = data.split("confirm_change:")[1]
+        # format: confirm_change:smart_wallet|eoa
+        payload = data.split("confirm_change:")[1]
+        parts = payload.split("|")
+        new_smart_wallet = parts[0]
+        new_eoa = parts[1] if len(parts) > 1 else None
         clear_chat_step(chat_id)
         edit_message(token, chat_id, message_id,
-            f"✅ Đang chuyển sang monitor ví mới:\n`{new_wallet}`")
-        start_monitoring(token, chat_id, api_key, new_wallet)
+            f"✅ *Đang chuyển sang monitor ví mới:*\n`{new_smart_wallet}`")
+        start_monitoring(token, chat_id, api_key, new_smart_wallet, new_eoa)
         return
 
     if data == "cancel_change":
@@ -655,7 +647,8 @@ def run_bot(token, api_key):
                 if monitor_thread and monitor_thread.is_alive():
                     daily = load_daily()
                     send_message(token, TELEGRAM_CHAT_ID,
-                        build_daily_summary(monitor_thread.wallet, daily))
+                        build_daily_summary(monitor_thread.wallet, daily),
+                        parse_mode="Markdown")
                     save_daily({"date": today_str, "total": 0, "markets": []})
                     last_summary_date = today_str
                     print(f"📊 Daily summary sent for {today_str}")
