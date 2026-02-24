@@ -12,6 +12,7 @@ from web3 import Web3
 # CONFIG
 # ============================================================
 OPINION_TRADE_URL = "https://openapi.opinion.trade/openapi/trade/user/{wallet}"
+OPINION_POSITIONS_URL = "https://openapi.opinion.trade/openapi/positions/user/{wallet}"
 POLL_SECONDS = 5
 HEARTBEAT_SECONDS = 3600
 DAILY_FILE = "daily_summary.json"
@@ -95,6 +96,44 @@ def find_smart_wallet(eoa_address: str) -> str | None:
 
 
 # ============================================================
+# FETCH POSITIONS
+# ============================================================
+
+def fetch_positions(api_key: str, wallet: str) -> str:
+    url = OPINION_POSITIONS_URL.format(wallet=wallet)
+    headers = {"apikey": api_key}
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        positions = data.get("data", data) if isinstance(data, dict) else data
+
+        if not positions or not isinstance(positions, list) or len(positions) == 0:
+            return f"📭 Ví `{wallet[:10]}...` không có position nào."
+
+        lines = [f"📊 Positions của ví `{wallet[:10]}...`\n"]
+        for i, p in enumerate(positions, 1):
+            market = p.get("marketTitle") or p.get("marketName") or p.get("title") or f"Market {p.get('marketId', '?')}"
+            outcome = "YES" if str(p.get("outcomeSide", "")) == "1" else "NO" if str(p.get("outcomeSide", "")) == "2" else str(p.get("outcomeSide", "?"))
+            shares = p.get("shares") or p.get("amount") or "?"
+            value = p.get("currentValue") or p.get("value") or p.get("usdValue") or "?"
+            pnl = p.get("pnl") or p.get("unrealizedPnl") or ""
+
+            lines.append(f"{i}. *{market[:50]}*")
+            lines.append(f"   {outcome} | Shares: {shares} | Value: {value}")
+            if pnl:
+                lines.append(f"   PnL: {pnl}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        print("❌ fetch_positions error:", repr(e))
+        return "❌ Không lấy được positions. Thử lại sau."
+
+
+# ============================================================
 # TELEGRAM HELPERS
 # ============================================================
 
@@ -139,6 +178,7 @@ MAIN_MENU_MARKUP = {
     "inline_keyboard": [
         [{"text": "🔍 Find Smart Wallet", "callback_data": "find_wallet"}],
         [{"text": "👁 Monitor Wallet",    "callback_data": "monitor_wallet"}],
+        [{"text": "📊 Xem Positions",     "callback_data": "view_positions"}],
         [{"text": "🤖 Copy Trade",        "callback_data": "copy_trade"}],
     ]
 }
@@ -422,6 +462,18 @@ def handle_message(token, api_key, message):
         send_main_menu(token, chat_id)
         return
 
+    if text == "/positions":
+        state = load_state()
+        wallet = state.get("monitored_wallet")
+        if wallet:
+            msg = fetch_positions(api_key, wallet)
+            send_message(token, chat_id, msg, parse_mode="Markdown",
+                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+        else:
+            send_message(token, chat_id, "⚠️ Chưa monitor ví nào. Bấm Monitor Wallet trước nhé!",
+                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+        return
+
     step = get_chat_step(chat_id)
 
     if step == "waiting_eoa":
@@ -503,6 +555,20 @@ def handle_callback(token, api_key, callback_query):
             reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
         return
 
+    if data == "view_positions":
+        state = load_state()
+        wallet = state.get("monitored_wallet")
+        if wallet:
+            edit_message(token, chat_id, message_id, "⏳ Đang lấy positions...")
+            msg = fetch_positions(api_key, wallet)
+            edit_message(token, chat_id, message_id, msg,
+                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+        else:
+            edit_message(token, chat_id, message_id,
+                "⚠️ Chưa monitor ví nào. Bấm Monitor Wallet trước nhé!",
+                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+        return
+
     if data == "find_wallet":
         clear_chat_step(chat_id)
         set_chat_step(chat_id, "waiting_eoa")
@@ -557,7 +623,7 @@ def run_bot(token, api_key):
     offset = 0
     last_summary_date = None
 
-    # Auto-resume: nếu có ví đã monitor từ lần trước thì tự động monitor lại
+    # Auto-resume monitor ví cũ khi restart
     state = load_state()
     saved_wallet = state.get("monitored_wallet")
     if saved_wallet:
@@ -582,7 +648,7 @@ def run_bot(token, api_key):
                 elif "callback_query" in update:
                     handle_callback(token, api_key, update["callback_query"])
 
-            # Daily summary lúc 23:58 trở đi (rộng hơn để không bỏ lỡ)
+            # Daily summary lúc 23:58
             now = datetime.now()
             today_str = str(date.today())
             if now.hour == 23 and now.minute >= 58 and last_summary_date != today_str:
