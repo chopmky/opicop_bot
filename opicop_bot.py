@@ -21,6 +21,8 @@ SAFE_PROXY_FACTORY = "0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2"
 
 MORALIS_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjY3NWUwMGY4LTdiMTYtNDRiMS04ZWMyLTc0ZWU5ODg4NDkwZCIsIm9yZ0lkIjoiNTAxOTg4IiwidXNlcklkIjoiNTE2NTIzIiwidHlwZUlkIjoiYmZlOTMyYjQtZWM2My00NzFmLTk5YzktNTJiMjJlNjFlMDQ4IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NzE4NjEzNzIsImV4cCI6NDkyNzYyMTM3Mn0.fJE8A3LO4FYDmC967VWOab6W4uREUUumm84XYaFWkh8"
 
+TELEGRAM_CHAT_ID = "508551859"
+
 TG_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
@@ -67,7 +69,6 @@ def find_smart_wallet(eoa_address: str) -> str | None:
         print(f"  Tx tới factory: {len(factory_txs)}")
 
         if not factory_txs:
-            print("  ❌ Không tìm thấy tx nào tới factory")
             return None
 
         for tx in factory_txs:
@@ -81,8 +82,7 @@ def find_smart_wallet(eoa_address: str) -> str | None:
             logs = tx_data.get("logs", []) if isinstance(tx_data, dict) else []
 
             for log in logs:
-                log_address = (log.get("address") or "").lower()
-                if log_address == factory_lower:
+                if (log.get("address") or "").lower() == factory_lower:
                     log_data = (log.get("data") or "").replace("0x", "")
                     if len(log_data) >= 64:
                         proxy_address = "0x" + log_data[24:64]
@@ -295,7 +295,6 @@ class MonitorThread(threading.Thread):
         self.last_seen_id = state.get("last_seen_id")
         self.daily = load_daily()
         self.last_heartbeat = 0
-        self.last_summary_date = None
 
     def stop(self):
         self.stop_event.set()
@@ -346,14 +345,6 @@ class MonitorThread(threading.Thread):
                             state["last_seen_id"] = self.last_seen_id
                             save_state(state)
 
-                now = datetime.now()
-                today_str = str(date.today())
-                if now.hour == 23 and now.minute >= 59 and self.last_summary_date != today_str:
-                    self.daily = load_daily()
-                    send_message(self.token, self.chat_id, build_daily_summary(self.wallet, self.daily))
-                    save_daily({"date": today_str, "total": 0, "markets": []})
-                    self.last_summary_date = today_str
-
             except Exception as e:
                 print("⚠️ Poll error:", repr(e))
                 consecutive_errors += 1
@@ -391,6 +382,7 @@ def start_monitoring(token, chat_id, api_key, wallet):
     state = load_state()
     state["last_seen_id"] = None
     state["monitored_wallet"] = wallet
+    state["chat_id"] = str(chat_id)
     save_state(state)
 
     if monitor_thread and monitor_thread.is_alive():
@@ -402,14 +394,13 @@ def start_monitoring(token, chat_id, api_key, wallet):
 
 
 def ask_confirm_change(token, chat_id, current_wallet, new_wallet):
-    """Hiển thị nút Có / Không khi đổi ví monitor"""
     send_message(
         token, chat_id,
         f"⚠️ Đang monitor ví:\n`{current_wallet}`\n\nBạn có muốn chuyển sang monitor ví mới không?\n`{new_wallet}`",
         reply_markup={
             "inline_keyboard": [
                 [
-                    {"text": "✅ Có, đổi ví",   "callback_data": f"confirm_change:{new_wallet}"},
+                    {"text": "✅ Có, đổi ví", "callback_data": f"confirm_change:{new_wallet}"},
                     {"text": "❌ Không, giữ nguyên", "callback_data": "cancel_change"},
                 ]
             ]
@@ -433,7 +424,6 @@ def handle_message(token, api_key, message):
 
     step = get_chat_step(chat_id)
 
-    # Chờ nhập EOA
     if step == "waiting_eoa":
         eoa = text
         send_message(token, chat_id,
@@ -447,17 +437,13 @@ def handle_message(token, api_key, message):
             state = load_state()
             current_wallet = state.get("monitored_wallet")
 
-            # Nếu đang monitor ví khác → hỏi xác nhận bằng nút
             if current_wallet and monitor_thread and monitor_thread.is_alive():
-                send_message(
-                    token, chat_id,
+                send_message(token, chat_id,
                     f"✅ Tìm thấy Smart Wallet!\n\nEOA: `{eoa}`\nSmart Wallet: `{smart_wallet}`",
-                    parse_mode="Markdown"
-                )
+                    parse_mode="Markdown")
                 ask_confirm_change(token, chat_id, current_wallet, smart_wallet)
             else:
-                send_message(
-                    token, chat_id,
+                send_message(token, chat_id,
                     f"✅ Tìm thấy Smart Wallet!\n\nEOA: `{eoa}`\nSmart Wallet: `{smart_wallet}`",
                     reply_markup={
                         "inline_keyboard": [
@@ -468,14 +454,12 @@ def handle_message(token, api_key, message):
                     parse_mode="Markdown"
                 )
         else:
-            send_message(
-                token, chat_id,
+            send_message(token, chat_id,
                 "❌ Không tìm thấy smart wallet cho EOA này.\n\nCó thể ví chưa từng dùng Opinion.",
                 reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]}
             )
         return
 
-    # Chờ nhập smart wallet để monitor
     if step == "waiting_smart_wallet":
         wallet = text
         clear_chat_step(chat_id)
@@ -543,23 +527,19 @@ def handle_callback(token, api_key, callback_query):
                 reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
         return
 
-    # Monitor ví vừa find (khi chưa có ví nào đang monitor)
     if data.startswith("monitor_found:"):
         wallet = data.split("monitor_found:")[1]
         start_monitoring(token, chat_id, api_key, wallet)
         return
 
-    # Xác nhận đổi ví → bấm nút Có
     if data.startswith("confirm_change:"):
         new_wallet = data.split("confirm_change:")[1]
         clear_chat_step(chat_id)
         edit_message(token, chat_id, message_id,
-            f"✅ Đang chuyển sang monitor ví mới:\n`{new_wallet}`",
-            parse_mode=None)
+            f"✅ Đang chuyển sang monitor ví mới:\n`{new_wallet}`")
         start_monitoring(token, chat_id, api_key, new_wallet)
         return
 
-    # Hủy đổi ví → bấm nút Không
     if data == "cancel_change":
         clear_chat_step(chat_id)
         edit_message(token, chat_id, message_id,
@@ -575,6 +555,16 @@ def handle_callback(token, api_key, callback_query):
 def run_bot(token, api_key):
     print("🤖 Bot started, polling Telegram updates...")
     offset = 0
+    last_summary_date = None
+
+    # Auto-resume: nếu có ví đã monitor từ lần trước thì tự động monitor lại
+    state = load_state()
+    saved_wallet = state.get("monitored_wallet")
+    if saved_wallet:
+        print(f"🔄 Auto-resume monitor ví: {saved_wallet}")
+        global monitor_thread
+        monitor_thread = MonitorThread(token, TELEGRAM_CHAT_ID, api_key, saved_wallet)
+        monitor_thread.start()
 
     while True:
         try:
@@ -591,6 +581,18 @@ def run_bot(token, api_key):
                     handle_message(token, api_key, update["message"])
                 elif "callback_query" in update:
                     handle_callback(token, api_key, update["callback_query"])
+
+            # Daily summary lúc 23:58 trở đi (rộng hơn để không bỏ lỡ)
+            now = datetime.now()
+            today_str = str(date.today())
+            if now.hour == 23 and now.minute >= 58 and last_summary_date != today_str:
+                if monitor_thread and monitor_thread.is_alive():
+                    daily = load_daily()
+                    send_message(token, TELEGRAM_CHAT_ID,
+                        build_daily_summary(monitor_thread.wallet, daily))
+                    save_daily({"date": today_str, "total": 0, "markets": []})
+                    last_summary_date = today_str
+                    print(f"📊 Daily summary sent for {today_str}")
 
         except Exception as e:
             print("⚠️ Update loop error:", repr(e))
