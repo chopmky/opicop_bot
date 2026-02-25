@@ -148,6 +148,70 @@ def fetch_positions(api_key: str, eoa: str) -> str:
 
 
 # ============================================================
+# FETCH HISTORY (dùng smart wallet, 10 trade gần nhất)
+# ============================================================
+
+def fetch_history(api_key: str, eoa: str) -> str:
+    url = OPINION_TRADE_URL.format(wallet=eoa)
+    headers = {"apikey": api_key}
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        result = data.get("result", {})
+        trades = result.get("list") or []
+        if not isinstance(trades, list):
+            return "❌ Không lấy được lịch sử trade."
+
+        trades = trades[:10]  # Lấy 10 gần nhất
+
+        if not trades:
+            return "📭 Ví chưa có trade nào."
+
+        lines = ["📜 *10 Trade gần nhất*\n"]
+        for i, t in enumerate(trades, 1):
+            side = str(t.get("side", "")).upper()
+            outcome = "YES" if str(t.get("outcomeSide", "")) == "1" else "NO"
+            market = t.get("rootMarketTitle") or t.get("marketTitle") or f"Market {t.get('marketId', '?')}"
+
+            # Giá tính bằng cent (nhân 100)
+            try:
+                price_raw = float(t.get("price") or 0)
+                price_str = f"{price_raw * 100:.1f}c"
+            except Exception:
+                price_str = "?"
+
+            # Dùng amount (USD thực tế)
+            try:
+                usd_str = f"${float(t.get('amount') or 0):.2f}"
+            except Exception:
+                usd_str = "?"
+
+            # Thời gian từ Unix timestamp
+            try:
+                ts = int(t.get("createdAt") or 0)
+                dt = datetime.fromtimestamp(ts)
+                time_str = dt.strftime("%d/%m %H:%M")
+            except Exception:
+                time_str = "?"
+
+            side_emoji = "🟢" if side == "BUY" else "🔴"
+            lines.append(
+                f"{i}. {side_emoji} *{side} {outcome}* — {usd_str} @ {price_str}\n"
+                f"   📌 {market[:50]}\n"
+                f"   🕐 {time_str}"
+            )
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        print("❌ fetch_history error:", repr(e))
+        return "❌ Không lấy được lịch sử trade. Thử lại sau."
+
+
+# ============================================================
 # TELEGRAM HELPERS
 # ============================================================
 
@@ -192,6 +256,7 @@ MAIN_MENU_MARKUP = {
     "inline_keyboard": [
         [{"text": "👁 Monitor Wallet",    "callback_data": "monitor_wallet"}],
         [{"text": "📊 Xem Positions",     "callback_data": "view_positions"}],
+        [{"text": "📜 Lịch sử Trade",     "callback_data": "view_history"}],
         [{"text": "🤖 Copy Trade",        "callback_data": "copy_trade"}],
     ]
 }
@@ -299,19 +364,37 @@ def fmt_outcome(side):
 
 
 def format_trade_message(wallet, t):
+    side = str(t.get("side") or "").upper()
+    outcome = fmt_outcome(t.get("outcomeSide"))
+    market_title = t.get("rootMarketTitle") or t.get("marketTitle") or "?"
+    root_market_id = t.get("rootMarketId") or t.get("marketId") or ""
+
+    # Build market URL
+    if root_market_id:
+        market_url = f"https://app.opinion.trade/detail?topicId={root_market_id}"
+        market_link = f"[{market_title}]({market_url})"
+    else:
+        market_link = market_title
+
+    try:
+        price_str = f"{float(t.get('price') or 0) * 100:.1f} ¢"
+    except Exception:
+        price_str = "?"
+
+    try:
+        usd_str = f"${float(t.get('amount') or 0):.2f}"
+    except Exception:
+        usd_str = "?"
+
     lines = [
-        "✅ TRADE EXECUTED (Opinion)",
-        f"Wallet: `{wallet}`",
-        f"Side: {t.get('side', '')} | Outcome: {fmt_outcome(t.get('outcomeSide'))}",
-        f"Price: {t.get('price')}",
-        f"Amount: {t.get('amount')} | USD: {t.get('usdAmount')}",
-        f"Shares: {t.get('shares')}",
-        f"Fee: {t.get('fee')}",
+        "✅ *TRADE EXECUTED*",
+        f"",
+        f"Market: {market_link}",
+        f"",
+        f"Target Wallet: `{wallet}`",
+        f"• Action: *{side} {outcome}* for {usd_str}",
+        f"• Order Price: {price_str}",
     ]
-    if t.get("txHash"):
-        lines.append(f"Tx: `{t['txHash']}`")
-    if t.get("createdAt"):
-        lines.append(f"Time: {t['createdAt']}")
     return "\n".join(lines)
 
 
@@ -324,7 +407,10 @@ def fetch_trades(api_key, wallet):
             resp = requests.get(url, headers=headers, timeout=45)
             resp.raise_for_status()
             data = resp.json()
-            return data["data"] if isinstance(data, dict) and "data" in data else data
+            # API trả về result.list
+            result = data.get("result", {})
+            trades = result.get("list") or []
+            return trades
         except Exception as e:
             last_err = e
             time.sleep(2)
@@ -443,16 +529,13 @@ def start_monitoring(token, chat_id, api_key, smart_wallet, eoa):
         monitor_thread.stop()
         monitor_thread.join(timeout=10)
 
-    monitor_thread = MonitorThread(token, chat_id, api_key, smart_wallet)
+    # Poll bằng EOA (API index theo EOA)
+    monitor_thread = MonitorThread(token, chat_id, api_key, eoa)
     monitor_thread.start()
 
 
 def do_find_and_monitor(token, chat_id, api_key, eoa):
-    """Tìm smart wallet từ EOA rồi bắt đầu monitor"""
-    send_message(token, chat_id,
-        f"🔍 Đang tìm smart wallet cho:\n`{eoa}`\n\nVui lòng chờ...",
-        parse_mode="Markdown")
-
+    """Tìm smart wallet từ EOA rồi bắt đầu monitor hoặc hỏi xác nhận"""
     smart_wallet = find_smart_wallet(eoa)
 
     if not smart_wallet:
@@ -465,18 +548,15 @@ def do_find_and_monitor(token, chat_id, api_key, eoa):
     state = load_state()
     current_wallet = state.get("monitored_wallet")
 
-    if current_wallet and monitor_thread and monitor_thread.is_alive():
-        # Đang monitor ví khác → hỏi xác nhận
-        send_message(token, chat_id,
-            f"✅ Tìm thấy Smart Wallet!\n\nEOA: `{eoa}`\nSmart Wallet: `{smart_wallet}`",
-            parse_mode="Markdown")
+    if current_wallet and current_wallet.lower() != smart_wallet.lower():
+        # Đang monitor ví khác → hỏi xác nhận bằng nút (gộp 1 message)
         send_message(
             token, chat_id,
-            f"⚠️ Đang monitor ví:\n`{current_wallet}`\n\nBạn có muốn chuyển sang monitor ví mới không?\n`{smart_wallet}`",
+            f"✅ Tìm thấy Smart Wallet!\n\nEOA: `{eoa}`\nSmart Wallet: `{smart_wallet}`\n\n⚠️ Đang monitor ví:\n`{current_wallet}`\n\nBạn có muốn chuyển sang monitor ví mới không?",
             reply_markup={
                 "inline_keyboard": [
                     [
-                        {"text": "✅ Có, đổi ví", "callback_data": f"confirm_change:{smart_wallet}|{eoa}"},
+                        {"text": "✅ Có, đổi ví", "callback_data": f"confirm_change:{smart_wallet}~{eoa}"},
                         {"text": "❌ Không, giữ nguyên", "callback_data": "cancel_change"},
                     ]
                 ]
@@ -516,13 +596,29 @@ def handle_message(token, api_key, message):
                 reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
         return
 
+    if text == "/history":
+        state = load_state()
+        eoa = state.get("monitored_eoa")
+        if eoa:
+            msg = fetch_history(api_key, eoa)
+            send_message(token, chat_id, msg, parse_mode="Markdown",
+                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+        else:
+            send_message(token, chat_id, "⚠️ Chưa monitor ví nào. Bấm Monitor Wallet trước nhé!",
+                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+        return
+
     step = get_chat_step(chat_id)
 
-    # Tất cả flow nhập ví đều dùng EOA
     if step == "waiting_eoa":
         eoa = text
         clear_chat_step(chat_id)
-        do_find_and_monitor(token, chat_id, api_key, eoa)
+        send_message(token, chat_id,
+            f"🔍 Đang tìm smart wallet cho:\n`{eoa}`\n\nVui lòng chờ...",
+            parse_mode="Markdown")
+        # Chạy trong thread riêng để không block bot
+        t = threading.Thread(target=do_find_and_monitor, args=(token, chat_id, api_key, eoa), daemon=True)
+        t.start()
         return
 
     send_message(token, chat_id, "Dùng /start để mở menu nhé!",
@@ -570,13 +666,27 @@ def handle_callback(token, api_key, callback_query):
                 reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
         return
 
+    if data == "view_history":
+        state = load_state()
+        eoa = state.get("monitored_eoa")
+        if eoa:
+            edit_message(token, chat_id, message_id, "⏳ Đang lấy lịch sử trade...")
+            msg = fetch_history(api_key, eoa)
+            edit_message(token, chat_id, message_id, msg,
+                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+        else:
+            edit_message(token, chat_id, message_id,
+                "⚠️ Chưa monitor ví nào. Bấm Monitor Wallet trước nhé!",
+                reply_markup={"inline_keyboard": [[{"text": "🏠 Menu chính", "callback_data": "main_menu"}]]})
+        return
+
     if data == "monitor_wallet":
         clear_chat_step(chat_id)
         set_chat_step(chat_id, "waiting_eoa")
         state = load_state()
         current_wallet = state.get("monitored_wallet")
 
-        if current_wallet and monitor_thread and monitor_thread.is_alive():
+        if current_wallet:
             edit_message(token, chat_id, message_id,
                 f"👁 Đang monitor ví:\n`{current_wallet}`\n\nNhập EOA wallet mới muốn monitor:",
                 reply_markup={"inline_keyboard": [[{"text": "🏠 Hủy bỏ", "callback_data": "main_menu"}]]})
@@ -587,9 +697,8 @@ def handle_callback(token, api_key, callback_query):
         return
 
     if data.startswith("confirm_change:"):
-        # format: confirm_change:smart_wallet|eoa
         payload = data.split("confirm_change:")[1]
-        parts = payload.split("|")
+        parts = payload.split("~")
         new_smart_wallet = parts[0]
         new_eoa = parts[1] if len(parts) > 1 else None
         clear_chat_step(chat_id)
@@ -617,13 +726,14 @@ def run_bot(token, api_key):
 
     # Auto-resume monitor ví cũ khi restart
     state = load_state()
-    saved_wallet = state.get("monitored_wallet")
-    if saved_wallet:
-        print(f"🔄 Auto-resume monitor ví: {saved_wallet}")
+    saved_eoa = state.get("monitored_eoa")
+    if saved_eoa:
+        print(f"🔄 Auto-resume monitor ví: {saved_eoa}")
         global monitor_thread
-        monitor_thread = MonitorThread(token, TELEGRAM_CHAT_ID, api_key, saved_wallet)
+        monitor_thread = MonitorThread(token, TELEGRAM_CHAT_ID, api_key, saved_eoa)
         monitor_thread.start()
 
+    processed_ids = set()
     while True:
         try:
             resp = requests.get(
@@ -634,7 +744,13 @@ def run_bot(token, api_key):
             updates = resp.json().get("result", [])
 
             for update in updates:
-                offset = update["update_id"] + 1
+                uid = update["update_id"]
+                offset = uid + 1
+                if uid in processed_ids:
+                    continue
+                processed_ids.add(uid)
+                if len(processed_ids) > 1000:
+                    processed_ids = set(list(processed_ids)[-500:])
                 if "message" in update:
                     handle_message(token, api_key, update["message"])
                 elif "callback_query" in update:
